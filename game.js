@@ -29,6 +29,39 @@ const dist  = (a, b)   => Math.hypot(a.x - b.x, a.y - b.y);
 const rand  = (min, max) => min + Math.random() * (max - min);
 const randInt = (min, max) => Math.floor(rand(min, max + 1));
 
+// ── Sprite del meteoro ────────────────────────────────────────────────────────
+// Los asteroides grandes (tamaño 3) se dibujan con esta imagen en vez del
+// polígono vectorial. METEOR_SPRITE (data URI) vive en meteor-sprite.js; si la
+// imagen no llegara a cargar, el asteroide vuelve solo al dibujo vectorial.
+const meteorImg = new Image();
+let meteorReady = false;
+meteorImg.onload = () => { meteorReady = true; };
+meteorImg.src = METEOR_SPRITE;
+
+// Geometría medida sobre el dibujo, en fracciones del lado del sprite: centro y
+// radio de la roca (la llama sobresale mucho más) y el ángulo llama→roca, que es
+// la dirección hacia la que el meteoro "viaja" dentro de la imagen.
+const MET_CX = 0.322;
+const MET_CY = 0.666;
+const MET_R  = 0.244;
+const MET_HEADING = 2.40;
+
+// Estrella de cuatro puntas para las chispas que titilan junto al meteoro
+function drawSparkle(x, y, r, alpha) {
+  ctx.fillStyle = `rgba(255, 238, 180, ${alpha.toFixed(2)})`;
+  ctx.beginPath();
+  ctx.moveTo(x,           y - r * 2.4);
+  ctx.lineTo(x + r * 0.5, y - r * 0.5);
+  ctx.lineTo(x + r * 2.4, y);
+  ctx.lineTo(x + r * 0.5, y + r * 0.5);
+  ctx.lineTo(x,           y + r * 2.4);
+  ctx.lineTo(x - r * 0.5, y + r * 0.5);
+  ctx.lineTo(x - r * 2.4, y);
+  ctx.lineTo(x - r * 0.5, y - r * 0.5);
+  ctx.closePath();
+  ctx.fill();
+}
+
 // ── Bullet ────────────────────────────────────────────────────────────────────
 class Bullet {
   constructor(x, y, angle) {
@@ -77,7 +110,7 @@ class Asteroid {
     this.rotSpeed = rand(-1.2, 1.2);
     this.rot = rand(0, Math.PI * 2);
 
-    // Polígono irregular
+    // Polígono irregular (los grandes usan el sprite, pero lo guardan de respaldo)
     const n = randInt(8, 13);
     this.verts = [];
     for (let i = 0; i < n; i++) {
@@ -85,12 +118,48 @@ class Asteroid {
       const r = this.radius * rand(0.6, 1.0);
       this.verts.push([Math.cos(a) * r, Math.sin(a) * r]);
     }
+
+    // Los grandes son meteoros en llamas: apuntan a su rumbo y destellan
+    this.meteor  = size === 3;
+    this.heading = Math.atan2(this.vy, this.vx);
+    this.flick      = rand(0, Math.PI * 2);   // fase del destello
+    this.flickSpeed = rand(5.5, 8.5);
+    this.emberTimer = 0;
+    this.sparks = [];
+    if (this.meteor)
+      for (let i = 0; i < 4; i++)
+        this.sparks.push({
+          ang:   rand(0, Math.PI * 2),
+          dist:  rand(0.55, 1.25),
+          phase: rand(0, Math.PI * 2),
+          speed: rand(3, 7),
+          size:  rand(1.4, 3.0),
+        });
   }
 
   update(dt) {
     this.x   = wrap(this.x + this.vx * dt, W);
     this.y   = wrap(this.y + this.vy * dt, H);
     this.rot += this.rotSpeed * dt;
+    if (!this.meteor) return;
+
+    this.flick += this.flickSpeed * dt;
+    for (const s of this.sparks) s.phase += s.speed * dt;
+
+    // Brasas que se van desprendiendo de la cola
+    const RATE = 0.05;
+    this.emberTimer -= dt;
+    if (this.emberTimer <= 0) {
+      this.emberTimer = RATE;
+      const back = this.heading + Math.PI;
+      const d    = this.radius * rand(0.9, 1.9);
+      spawnEmber(
+        this.x + Math.cos(back) * d + rand(-8, 8),
+        this.y + Math.sin(back) * d + rand(-8, 8),
+        Math.cos(back) * rand(15, 55) + rand(-30, 30),
+        Math.sin(back) * rand(15, 55) + rand(-30, 30),
+      );
+    }
   }
 
   split() {
@@ -101,7 +170,53 @@ class Asteroid {
     ];
   }
 
+  // Meteoro: halo palpitante + sprite + pasada aditiva que lo hace destellar
+  drawMeteor() {
+    const pulse = 0.5 + 0.5 * Math.sin(this.flick);           // 0..1
+    const size  = (this.radius / MET_R) * (1 + 0.03 * pulse);  // leve latido
+    const dx    = -MET_CX * size;
+    const dy    = -MET_CY * size;
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Halo de calor alrededor de la roca
+    const halo = this.radius * (1.5 + 0.35 * pulse);
+    const glow = ctx.createRadialGradient(0, 0, this.radius * 0.35, 0, 0, halo);
+    glow.addColorStop(0,    `rgba(255, 190, 70, ${(0.28 + 0.22 * pulse).toFixed(2)})`);
+    glow.addColorStop(0.55, `rgba(255, 110, 20, ${(0.12 + 0.12 * pulse).toFixed(2)})`);
+    glow.addColorStop(1,     'rgba(255, 60, 0, 0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, halo, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Chispas que titilan a su alrededor
+    for (const s of this.sparks) {
+      const tw = Math.sin(s.phase);
+      if (tw <= 0) continue;
+      const a = s.ang + this.flick * 0.15;
+      const d = this.radius * s.dist;
+      drawSparkle(Math.cos(a) * d, Math.sin(a) * d, s.size * (0.6 + tw), tw * 0.9);
+    }
+
+    // La imagen, con la roca centrada en el origen y apuntando a su rumbo
+    ctx.rotate(this.heading - MET_HEADING + Math.sin(this.flick * 0.6) * 0.06);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(meteorImg, dx, dy, size, size);
+
+    // Segunda pasada aditiva: el fuego late sobre el propio dibujo
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.10 + 0.20 * pulse;
+    ctx.drawImage(meteorImg, dx, dy, size, size);
+
+    ctx.restore();
+  }
+
   draw() {
+    if (this.meteor && meteorReady) { this.drawMeteor(); return; }
+
     ctx.save();
     ctx.translate(this.x, this.y);
     ctx.rotate(this.rot);
@@ -205,9 +320,10 @@ class Ship {
 
 // ── Partículas (explosión) ────────────────────────────────────────────────────
 class Particle {
-  constructor(x, y) {
-    this.x  = x;
-    this.y  = y;
+  constructor(x, y, rgb = '255,255,255') {
+    this.x   = x;
+    this.y   = y;
+    this.rgb = rgb;
     const angle = rand(0, Math.PI * 2);
     const speed = rand(30, 130);
     this.vx   = Math.cos(angle) * speed;
@@ -226,7 +342,7 @@ class Particle {
 
   draw() {
     const alpha = this.ttl / this.life;
-    ctx.strokeStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
+    ctx.strokeStyle = `rgba(${this.rgb},${alpha.toFixed(2)})`;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(this.x, this.y);
@@ -273,8 +389,17 @@ function nextLevel() {
   spawnAsteroids(3 + level);
 }
 
-function explode(x, y, count = 8) {
-  for (let i = 0; i < count; i++) particles.push(new Particle(x, y));
+function explode(x, y, count = 8, rgb) {
+  for (let i = 0; i < count; i++) particles.push(new Particle(x, y, rgb));
+}
+
+// Brasa naranja que va soltando la estela del meteoro
+function spawnEmber(x, y, vx, vy) {
+  const p = new Particle(x, y, `255,${randInt(110, 205)},45`);
+  p.vx   = vx;
+  p.vy   = vy;
+  p.life = p.ttl = rand(0.25, 0.65);
+  particles.push(p);
 }
 
 function killShip() {
@@ -328,7 +453,8 @@ function update(dt) {
         b.dead = true;
         a.dead = true;
         score += POINTS[a.size];
-        explode(a.x, a.y, a.size * 5);
+        if (a.meteor) explode(a.x, a.y, 24, '255,150,45');
+        else          explode(a.x, a.y, a.size * 5);
         newAsteroids.push(...a.split());
       }
     }
